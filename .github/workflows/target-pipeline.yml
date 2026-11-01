@@ -1,0 +1,612 @@
+# =============================================================================
+# target-pipeline — one target repo through the full factory chain.
+#
+# Called by factory-pipeline (one call per target, isolated). Stages:
+#   requirements -> design -> backend -> bootstrap-api -> verify-api
+#   -> web -> bootstrap-web -> verify-live
+#
+# Agent stages clone their workspace from the matching lmck-factory repo,
+# run `opencode run` under a timeout, and commit/push into the target repo.
+# After each agent stage the job asserts the stage actually pushed commits
+# (a stage ending on one of its own gates exits 0 without delivering) and
+# validates the delivered contract (render.yaml / openapi.yaml against
+# docs/factory-contract.md) before the chain continues.
+# On stage failure a resume bundle (.work + OpenCode session data) is
+# archived — stage-scoped per target — and — on the first failure — the
+# pipeline re-dispatches itself with start_from=<stage> + resume_session so
+# the run continues where it stopped instead of restarting.
+# =============================================================================
+name: target-pipeline
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "Target repo (owner/repo)"
+        type: string
+        required: true
+      start_from:
+        description: "First stage to run; empty = full chain"
+        type: string
+        default: ""
+      resume_session:
+        description: "OpenCode session id to resume in the start_from stage"
+        type: string
+        default: ""
+      attempt:
+        description: "Resume attempt counter"
+        type: string
+        default: "1"
+      run_stages:
+        description: "Space-separated stages to execute"
+        type: string
+        default: "requirements design backend bootstrap-api verify-api web bootstrap-web verify-live"
+      requirements_folder:
+        type: string
+        default: "docs/requirements"
+      design_folder:
+        type: string
+        default: "docs/solution-design"
+
+env:
+  TARGET: ${{ inputs.target }}
+  REQ_FOLDER: ${{ inputs.requirements_folder }}
+  DESIGN_FOLDER: ${{ inputs.design_folder }}
+  CONCEPT_FOLDER: docs/concept
+  MODEL: ${{ vars.PIPELINE_MODEL || 'openrouter/auto' }}
+  MODEL_ENVVAR: ${{ vars.PIPELINE_MODEL_ENVVAR || 'OPENROUTER_API_KEY' }}
+  OPENCODE_VERSION: ${{ vars.OPENCODE_VERSION || 'latest' }}
+  TIMEOUT_MIN: "330"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  requirements:
+    if: ${{ !failure() && !cancelled() && contains(format(' {0} ', inputs.run_stages), ' requirements ') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    outputs:
+      pushed: ${{ steps.delivered.outputs.pushed }}
+      head_sha: ${{ steps.delivered.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prepare
+        run: echo "SAFE_TARGET=${TARGET/\//-}" >> "$GITHUB_ENV"
+      - name: Install OpenCode
+        run: npm install -g "opencode-ai@${OPENCODE_VERSION}"
+      - name: Install runner dependencies (contract validation)
+        run: npm install --no-audit --no-fund
+      - name: Configure git auth for target clones
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: source scripts/lib.sh && configure_git_auth
+      - name: Gate check (concept material)
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          GATE: requirements
+        run: bash scripts/gate-check.sh
+      - name: Checkout agent workspace
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          STAGE: requirements
+        run: bash scripts/checkout-agents.sh
+      - name: Restore resume state
+        if: inputs.resume_session != '' && inputs.start_from == 'requirements'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_DIR: .factory/agents/product-manager
+          STAGE: requirements
+        run: bash scripts/restore-resume.sh
+      - name: Snapshot branch head (before)
+        id: before
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          br=$(gh api "repos/${TARGET}" --jq .default_branch)
+          sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
+          echo "before: ${br} @ ${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+      - name: Run requirements stage
+        env:
+          STAGE: requirements
+          AGENT_DIR: .factory/agents/product-manager
+          MODEL_KEY: ${{ secrets.OPENCODE_MODEL_API_KEY }}
+        run: bash scripts/run-stage.sh
+      - name: Assert stage delivered
+        id: delivered
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          BEFORE_SHA: ${{ steps.before.outputs.sha }}
+        run: |
+          set -euo pipefail
+          br=$(gh api "repos/${TARGET}" --jq .default_branch)
+          sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
+          echo "requirements: ${br} ${BEFORE_SHA} -> ${sha}"
+          if [ "$sha" = "$BEFORE_SHA" ]; then
+            echo "::error::stage requirements delivered no commits — the agent most likely ended on one of its own gates (see the stage log for its stated reason)"
+            exit 1
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Upload stage state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_TARGET }}-requirements-state
+          path: .factory/state/
+          if-no-files-found: ignore
+          overwrite: true
+      - name: Archive resume bundle
+        if: failure()
+        run: tar czf /tmp/resume.tgz .factory/state .factory/opencode-data .factory/agents/product-manager/.work 2>/dev/null || tar czf /tmp/resume.tgz .factory/state
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ${{ env.SAFE_TARGET }}-requirements-resume-bundle
+          path: /tmp/resume.tgz
+          overwrite: true
+      - name: Queue auto-resume
+        if: failure() && fromJSON(inputs.attempt) < 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SID=$(jq -r '.session_id // empty' .factory/state/requirements.state.json 2>/dev/null || true)
+          NEXT=$(( ${{ inputs.attempt }} + 1 ))
+          echo "queueing resume attempt $NEXT for requirements (session ${SID:-<none>})"
+          gh workflow run factory-pipeline.yml \
+            -f target="$TARGET" -f start_from=requirements \
+            -f resume_session="$SID" -f attempt="$NEXT"
+
+  # ---------------------------------------------------------------------------
+  design:
+    needs: requirements
+    if: ${{ !failure() && !cancelled() && contains(format(' {0} ', inputs.run_stages), ' design ') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    outputs:
+      pushed: ${{ steps.delivered.outputs.pushed }}
+      head_sha: ${{ steps.delivered.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prepare
+        run: echo "SAFE_TARGET=${TARGET/\//-}" >> "$GITHUB_ENV"
+      - name: Install OpenCode
+        run: npm install -g "opencode-ai@${OPENCODE_VERSION}"
+      - name: Install runner dependencies (contract validation)
+        run: npm install --no-audit --no-fund
+      - name: Configure git auth for target clones
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: source scripts/lib.sh && configure_git_auth
+      - name: Gate check (requirements delivered)
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          GATE: design
+          GATE_PUSHED: ${{ needs.requirements.outputs.pushed }}
+        run: bash scripts/gate-check.sh
+      - name: Checkout agent workspace
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          STAGE: design
+        run: bash scripts/checkout-agents.sh
+      - name: Restore resume state
+        if: inputs.resume_session != '' && inputs.start_from == 'design'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_DIR: .factory/agents/solution-architect
+          STAGE: design
+        run: bash scripts/restore-resume.sh
+      - name: Snapshot branch head (before)
+        id: before
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          br=$(gh api "repos/${TARGET}" --jq .default_branch)
+          sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
+          echo "before: ${br} @ ${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+      - name: Run design stage
+        env:
+          STAGE: design
+          AGENT_DIR: .factory/agents/solution-architect
+          MODEL_KEY: ${{ secrets.OPENCODE_MODEL_API_KEY }}
+        run: bash scripts/run-stage.sh
+      - name: Assert stage delivered
+        id: delivered
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          BEFORE_SHA: ${{ steps.before.outputs.sha }}
+        run: |
+          set -euo pipefail
+          br=$(gh api "repos/${TARGET}" --jq .default_branch)
+          sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
+          echo "design: ${br} ${BEFORE_SHA} -> ${sha}"
+          if [ "$sha" = "$BEFORE_SHA" ]; then
+            echo "::error::stage design delivered no commits — the agent most likely ended on one of its own gates (see the stage log for its stated reason)"
+            exit 1
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Upload stage state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_TARGET }}-design-state
+          path: .factory/state/
+          if-no-files-found: ignore
+          overwrite: true
+      - name: Archive resume bundle
+        if: failure()
+        run: tar czf /tmp/resume.tgz .factory/state .factory/opencode-data .factory/agents/solution-architect/.work 2>/dev/null || tar czf /tmp/resume.tgz .factory/state
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ${{ env.SAFE_TARGET }}-design-resume-bundle
+          path: /tmp/resume.tgz
+          overwrite: true
+      - name: Queue auto-resume
+        if: failure() && fromJSON(inputs.attempt) < 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SID=$(jq -r '.session_id // empty' .factory/state/design.state.json 2>/dev/null || true)
+          NEXT=$(( ${{ inputs.attempt }} + 1 ))
+          gh workflow run factory-pipeline.yml \
+            -f target="$TARGET" -f start_from=design \
+            -f resume_session="$SID" -f attempt="$NEXT"
+
+  # ---------------------------------------------------------------------------
+  backend:
+    needs: design
+    if: ${{ !failure() && !cancelled() && contains(format(' {0} ', inputs.run_stages), ' backend ') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    outputs:
+      pushed: ${{ steps.delivered.outputs.pushed }}
+      head_sha: ${{ steps.delivered.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prepare
+        run: echo "SAFE_TARGET=${TARGET/\//-}" >> "$GITHUB_ENV"
+      - name: Install OpenCode
+        run: npm install -g "opencode-ai@${OPENCODE_VERSION}"
+      - name: Install runner dependencies (contract validation)
+        run: npm install --no-audit --no-fund
+      - name: Configure git auth for target clones
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: source scripts/lib.sh && configure_git_auth
+      - name: Gate check (design delivered)
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          GATE: backend
+          GATE_PUSHED: ${{ needs.design.outputs.pushed }}
+        run: bash scripts/gate-check.sh
+      - name: Checkout agent workspace
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          STAGE: backend
+        run: bash scripts/checkout-agents.sh
+      - name: Restore resume state
+        if: inputs.resume_session != '' && inputs.start_from == 'backend'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_DIR: .factory/agents/backend-developer
+          STAGE: backend
+        run: bash scripts/restore-resume.sh
+      - name: Snapshot branch head (before)
+        id: before
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          br=$(gh api "repos/${TARGET}" --jq .default_branch)
+          sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
+          echo "before: ${br} @ ${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+      - name: Run backend stage
+        env:
+          STAGE: backend
+          AGENT_DIR: .factory/agents/backend-developer
+          MODEL_KEY: ${{ secrets.OPENCODE_MODEL_API_KEY }}
+        run: bash scripts/run-stage.sh
+      - name: Assert stage delivered (+ contract validation)
+        id: delivered
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          BEFORE_SHA: ${{ steps.before.outputs.sha }}
+        run: |
+          set -euo pipefail
+          br=$(gh api "repos/${TARGET}" --jq .default_branch)
+          sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
+          echo "backend: ${br} ${BEFORE_SHA} -> ${sha}"
+          if [ "$sha" = "$BEFORE_SHA" ]; then
+            echo "::error::stage backend delivered no commits — the agent most likely ended on one of its own gates (see the stage log for its stated reason)"
+            exit 1
+          fi
+          # The factory contract must hold before the Render bootstrap runs on
+          # these deliverables (docs/factory-contract.md).
+          mkdir -p /tmp/contract
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/${TARGET}/contents/app/api/render.yaml?ref=${br}" > /tmp/contract/render.yaml
+          node scripts/validate-blueprint.mjs --kind api --file /tmp/contract/render.yaml
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/${TARGET}/contents/app/api/openapi.yaml?ref=${br}" > /tmp/contract/openapi.yaml
+          node scripts/validate-blueprint.mjs --kind openapi --file /tmp/contract/openapi.yaml
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Upload stage state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_TARGET }}-backend-state
+          path: .factory/state/
+          if-no-files-found: ignore
+          overwrite: true
+      - name: Archive resume bundle
+        if: failure()
+        run: tar czf /tmp/resume.tgz .factory/state .factory/opencode-data .factory/agents/backend-developer/.work 2>/dev/null || tar czf /tmp/resume.tgz .factory/state
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ${{ env.SAFE_TARGET }}-backend-resume-bundle
+          path: /tmp/resume.tgz
+          overwrite: true
+      - name: Queue auto-resume
+        if: failure() && fromJSON(inputs.attempt) < 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SID=$(jq -r '.session_id // empty' .factory/state/backend.state.json 2>/dev/null || true)
+          NEXT=$(( ${{ inputs.attempt }} + 1 ))
+          gh workflow run factory-pipeline.yml \
+            -f target="$TARGET" -f start_from=backend \
+            -f resume_session="$SID" -f attempt="$NEXT"
+
+  # ---------------------------------------------------------------------------
+  bootstrap-api:
+    needs: backend
+    if: ${{ !failure() && !cancelled() && contains(format(' {0} ', inputs.run_stages), ' bootstrap-api ') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      api_url: ${{ steps.provision.outputs.api_url }}
+      api_service_id: ${{ steps.provision.outputs.api_service_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Clone target (blueprint + branch resolution)
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: |
+          source scripts/lib.sh && configure_git_auth
+          git clone "https://github.com/${TARGET}.git" /tmp/target
+      - id: provision
+        name: Provision Render API + Postgres, sync secrets, deploy
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          TARGET_CLONE: /tmp/target
+          STAGE: api
+          TRIGGER_DEPLOY: "1"
+        run: node scripts/render-bootstrap.mjs
+
+  # ---------------------------------------------------------------------------
+  verify-api:
+    needs: bootstrap-api
+    if: ${{ !failure() && !cancelled() && contains(format(' {0} ', inputs.run_stages), ' verify-api ') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Wait for API deploy and smoke-test
+        env:
+          API_URL: ${{ needs.bootstrap-api.outputs.api_url }}
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          ATTEMPTS: "90"
+          INTERVAL_SEC: "20"
+        run: node scripts/smoke-test.mjs
+
+  # ---------------------------------------------------------------------------
+  web:
+    needs: verify-api
+    if: ${{ !failure() && !cancelled() && contains(format(' {0} ', inputs.run_stages), ' web ') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    outputs:
+      pushed: ${{ steps.delivered.outputs.pushed }}
+      head_sha: ${{ steps.delivered.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prepare
+        run: echo "SAFE_TARGET=${TARGET/\//-}" >> "$GITHUB_ENV"
+      - name: Install OpenCode
+        run: npm install -g "opencode-ai@${OPENCODE_VERSION}"
+      - name: Install runner dependencies (contract validation)
+        run: npm install --no-audit --no-fund
+      - name: Configure git auth for target clones
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: source scripts/lib.sh && configure_git_auth
+      - name: Gate check (design delivered, contract present)
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          GATE: web
+        run: bash scripts/gate-check.sh
+      - name: Checkout agent workspace
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          STAGE: web
+        run: bash scripts/checkout-agents.sh
+      - name: Restore resume state
+        if: inputs.resume_session != '' && inputs.start_from == 'web'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_DIR: .factory/agents/web-developer
+          STAGE: web
+        run: bash scripts/restore-resume.sh
+      - name: Snapshot branch head (before)
+        id: before
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          br=$(gh api "repos/${TARGET}" --jq .default_branch)
+          sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
+          echo "before: ${br} @ ${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+      - name: Run web stage
+        env:
+          STAGE: web
+          AGENT_DIR: .factory/agents/web-developer
+          MODEL_KEY: ${{ secrets.OPENCODE_MODEL_API_KEY }}
+        run: bash scripts/run-stage.sh
+      - name: Assert stage delivered (+ blueprint validation)
+        id: delivered
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          BEFORE_SHA: ${{ steps.before.outputs.sha }}
+        run: |
+          set -euo pipefail
+          br=$(gh api "repos/${TARGET}" --jq .default_branch)
+          sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
+          echo "web: ${br} ${BEFORE_SHA} -> ${sha}"
+          if [ "$sha" = "$BEFORE_SHA" ]; then
+            echo "::error::stage web delivered no commits — the agent most likely ended on one of its own gates (see the stage log for its stated reason)"
+            exit 1
+          fi
+          # The web blueprint must satisfy the factory contract before the
+          # Render bootstrap consumes it (docs/factory-contract.md).
+          mkdir -p /tmp/contract
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/${TARGET}/contents/app/web/render.yaml?ref=${br}" > /tmp/contract/render-web.yaml
+          node scripts/validate-blueprint.mjs --kind web --file /tmp/contract/render-web.yaml
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Upload stage state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_TARGET }}-web-state
+          path: .factory/state/
+          if-no-files-found: ignore
+          overwrite: true
+      - name: Archive resume bundle
+        if: failure()
+        run: tar czf /tmp/resume.tgz .factory/state .factory/opencode-data .factory/agents/web-developer/.work 2>/dev/null || tar czf /tmp/resume.tgz .factory/state
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ${{ env.SAFE_TARGET }}-web-resume-bundle
+          path: /tmp/resume.tgz
+          overwrite: true
+      - name: Queue auto-resume
+        if: failure() && fromJSON(inputs.attempt) < 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SID=$(jq -r '.session_id // empty' .factory/state/web.state.json 2>/dev/null || true)
+          NEXT=$(( ${{ inputs.attempt }} + 1 ))
+          gh workflow run factory-pipeline.yml \
+            -f target="$TARGET" -f start_from=web \
+            -f resume_session="$SID" -f attempt="$NEXT"
+
+  # ---------------------------------------------------------------------------
+  bootstrap-web:
+    # bootstrap-api is needed (not just upstream-of-upstream) so its api_url
+    # output is readable here — GitHub only exposes outputs of direct needs.
+    # On a bootstrap-web-only restart bootstrap-api is skipped, its output is
+    # empty, and render-bootstrap falls back to the API service in Render.
+    needs: [web, bootstrap-api]
+    if: ${{ !failure() && !cancelled() && contains(format(' {0} ', inputs.run_stages), ' bootstrap-web ') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      web_url: ${{ steps.web-svc.outputs.web_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Clone target (blueprint + branch resolution)
+        env:
+          FACTORY_PUSH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+        run: |
+          source scripts/lib.sh && configure_git_auth
+          git clone "https://github.com/${TARGET}.git" /tmp/target
+      - id: web-svc
+        name: Provision Render web service, wire API base URL, deploy
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          TARGET_CLONE: /tmp/target
+          STAGE: web
+          # Wires VITE_API_BASE_URL / NEXT_PUBLIC_API_BASE_URL on the web
+          # service (render-bootstrap also falls back to the API service
+          # already in Render when this is empty, e.g. on a bootstrap-web-only
+          # resume where bootstrap-api was skipped).
+          API_URL: ${{ needs.bootstrap-api.outputs.api_url }}
+          TRIGGER_DEPLOY: "1"
+        run: node scripts/render-bootstrap.mjs
+      - name: Wire API CORS to the web origin and redeploy API
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          TARGET_CLONE: /tmp/target
+          STAGE: api
+          CORS_ORIGIN: ${{ steps.web-svc.outputs.web_url }}
+          TRIGGER_DEPLOY: "1"
+        run: node scripts/render-bootstrap.mjs
+
+  # ---------------------------------------------------------------------------
+  verify-live:
+    needs: [bootstrap-api, bootstrap-web]
+    if: ${{ !failure() && !cancelled() && contains(format(' {0} ', inputs.run_stages), ' verify-live ') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Smoke-test web + API + CORS
+        env:
+          WEB_URL: ${{ needs.bootstrap-web.outputs.web_url }}
+          API_URL: ${{ needs.bootstrap-api.outputs.api_url }}
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          REQUIRE_CORS: "1"
+          ATTEMPTS: "150"
+          INTERVAL_SEC: "20"
+        run: node scripts/smoke-test.mjs
+      - name: Reconcile repo + Render state
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          REQUIRE: "1"
+        run: node scripts/reconcile-check.mjs

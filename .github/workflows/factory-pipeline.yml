@@ -1,0 +1,123 @@
+# =============================================================================
+# factory-pipeline — orchestrates the four OpenCode agent workspaces
+#
+#   requirements (product-manager)  ->  design (solution-architect)
+#   ->  backend (backend-developer)  ->  Render bootstrap + API verify
+#   ->  web (web-developer)          ->  Render bootstrap + live verify
+#
+# One reusable chain runs per target repo (vars.TARGET_REPOS), isolated per
+# target. Manual dispatch supports start_from + resume_session to continue an
+# interrupted stage; the scheduled run performs drift detection and re-runs
+# targets whose concept material changed.
+# =============================================================================
+name: factory-pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Single target (owner/repo); empty = every repo in the TARGET_REPOS variable"
+        required: false
+        default: ""
+      start_from:
+        description: "First stage to run (requirements|design|backend|bootstrap-api|web|bootstrap-web); empty = from the top. verify-* stages are chain-internal — start at the matching bootstrap-* instead"
+        required: false
+        default: ""
+      resume_session:
+        description: "OpenCode session id to resume inside the start_from stage"
+        required: false
+        default: ""
+      attempt:
+        description: "Resume attempt counter (auto-resume increments this; stops at 2)"
+        required: false
+        default: "1"
+  schedule:
+    # Weekly drift check: only targets whose concept changed get a full run.
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: write # drift state commit
+  actions: write # auto-resume dispatch
+
+jobs:
+  drift:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      changed_targets: ${{ steps.check.outputs.changed_targets }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - id: check
+        name: Detect concept drift per target
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          TARGET_REPOS: ${{ vars.TARGET_REPOS }}
+        run: |
+          set -euo pipefail
+          changed='[]'
+          for repo in $(echo "$TARGET_REPOS" | jq -r '.[]'); do
+            slug=$(echo "$repo" | tr '/' '-')
+            TARGET="$repo" STATE_FILE=state/drift.json RESULT_FILE="/tmp/drift-$slug.json" \
+              node scripts/drift-check.mjs || echo "drift check failed for $repo — treating as unchanged"
+            if [ -f "/tmp/drift-$slug.json" ] && [ "$(jq -r '.changed' "/tmp/drift-$slug.json")" = "true" ]; then
+              changed=$(echo "$changed" | jq --arg r "$repo" '. + [$r]')
+            fi
+          done
+          echo "changed_targets=$changed" >> "$GITHUB_OUTPUT"
+          echo "drifted targets: $changed"
+      - name: Commit drift state
+        run: |
+          git config user.name "factory-drift-bot"
+          git config user.email "factory-drift-bot@users.noreply.github.com"
+          git add state/drift.json
+          git diff --cached --quiet || git commit -m "chore: update drift state [skip ci]"
+          git push || echo "drift state push skipped (likely no changes or protected branch)"
+
+  resolve:
+    needs: [drift]
+    if: always() && (github.event_name != 'schedule' || needs.drift.result == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+      run_stages: ${{ steps.plan.outputs.run_stages }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        name: Resolve targets and stages
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PUSH_TOKEN }}
+          # On schedule: only drifted targets; on dispatch: the configured list.
+          TARGET_REPOS: ${{ github.event_name == 'schedule' && needs.drift.outputs.changed_targets || vars.TARGET_REPOS }}
+          INPUT_TARGET: ${{ inputs.target }}
+          INPUT_START_FROM: ${{ inputs.start_from }}
+          INPUT_RESUME_SESSION: ${{ inputs.resume_session }}
+          INPUT_ATTEMPT: ${{ inputs.attempt }}
+          PIPELINE_MODEL: ${{ vars.PIPELINE_MODEL }}
+          PIPELINE_MODEL_ENVVAR: ${{ vars.PIPELINE_MODEL_ENVVAR }}
+        run: bash scripts/resolve-inputs.sh
+
+  run_target:
+    needs: resolve
+    if: needs.resolve.outputs.targets != '[]' && needs.resolve.outputs.targets != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.resolve.outputs.targets) }}
+    concurrency:
+      group: factory-${{ matrix.target.repo }}
+      cancel-in-progress: false
+    uses: ./.github/workflows/target-pipeline.yml
+    with:
+      target: ${{ matrix.target.repo }}
+      start_from: ${{ matrix.target.start_from }}
+      resume_session: ${{ matrix.target.resume_session }}
+      attempt: ${{ matrix.target.attempt }}
+      run_stages: ${{ needs.resolve.outputs.run_stages }}
+      requirements_folder: docs/requirements
+      design_folder: docs/solution-design
+    secrets: inherit

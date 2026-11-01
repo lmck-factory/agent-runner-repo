@@ -1,0 +1,18 @@
+{
+  "name": "agent-runner-repo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenCode four-stage factory orchestrator: GitHub Actions pipeline that runs product-manager -> solution-architect -> backend-developer -> web-developer against target repos and deploys the result on Render.",
+  "type": "module",
+  "scripts": {
+    "resolve": "bash scripts/resolve-inputs.sh",
+    "reconcile": "node scripts/reconcile-check.mjs",
+    "drift": "node scripts/drift-check.mjs"
+  },
+  "dependencies": {
+    "yaml": "^2.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
