@@ -103,7 +103,17 @@ jobs:
 
   run_target:
     needs: resolve
-    if: needs.resolve.outputs.targets != '[]' && needs.resolve.outputs.targets != ''
+    # `drift` is skipped on workflow_dispatch, and a skip propagates down the
+    # whole needs chain (drift -> resolve -> run_target). Any `if` without a
+    # status-check function gets an implicit success() ANDed in, which is then
+    # false on dispatch and silently skips this job before the matrix is ever
+    # evaluated. `always()` opts out; the explicit result check keeps the old
+    # guard (skip when resolve failed or produced nothing).
+    if: >-
+      always() &&
+      needs.resolve.result == 'success' &&
+      needs.resolve.outputs.targets != '[]' &&
+      needs.resolve.outputs.targets != ''
     strategy:
       fail-fast: false
       matrix:
