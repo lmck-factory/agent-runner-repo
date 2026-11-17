@@ -1,10 +1,10 @@
 # Factory contract (v1)
 
 The machine-verifiable contract between the four agent workspaces and the
-orchestrator. Everything here is **enforced** by the pipeline — by
-`gate-check.sh` before each stage, by the per-stage "assert delivered" steps,
-by `validate-blueprint.mjs`, and by `render-bootstrap.mjs` / `smoke-test.mjs` /
-`reconcile-check.mjs` at deploy time. A stage that violates it fails **at the
+orchestrator. Each workspace enforces its side internally (its own input
+gates, critic loops, and the contract rules in its `AGENTS.md`), and the
+pipeline's per-stage "assert delivered" steps assert that every stage pushed
+its deliverables — a stage that violates the contract fails **at the
 responsible stage**, not downstream with a confusing error.
 
 The copies in `backend-developer/factory-contract.md` and
@@ -68,14 +68,13 @@ Rules:
 - `critic.unresolved_findings` must be `0` for `status: "delivered"`; findings
   the critic cap leaves open are logged in the stage README's "Unresolved
   critic findings" and reduce the run's quality score, but do not block.
-- `deliverables` lists the paths the stage pushed; the reconcile check warns
-  when a listed path is missing on the branch.
+- `deliverables` lists the paths the stage pushed.
 
-## 3. `render.yaml` (the deploy blueprint the bootstrap consumes)
+## 3. `render.yaml` (the deploy blueprint)
 
-The bootstrap (`render-bootstrap.mjs`) provisions Render resources **only**
-from `app/api/render.yaml` and `app/web/render.yaml`, validated by
-`validate-blueprint.mjs --kind api|web`.
+Render resources are provisioned from `app/api/render.yaml` and
+`app/web/render.yaml` — the shapes below are what the target's own deploy
+wiring and any provisioning step expect.
 
 ### API blueprint (`app/api/render.yaml`)
 
@@ -84,13 +83,14 @@ from `app/api/render.yaml` and `app/web/render.yaml`, validated by
   - `healthCheckPath` (convention: `/actuator/health`, publicly reachable,
     unauthenticated);
   - `envVars` declaring, with `sync: false`:
-    - `DATABASE_URL` — wired by the bootstrap from the managed database;
-    - `CORS_ALLOWED_ORIGINS` — wired by the bootstrap to the deployed web
-      origin after the web service exists (the API must read it at runtime and
-      redeploy to take effect; the bootstrap triggers that redeploy).
-- Declares at least one managed database under `databases:` (the bootstrap
-  provisions it and wires `DATABASE_URL`; the instance is named
-  `<target-slug>-<declared name>` so targets never collide).
+    - `DATABASE_URL` — the managed database's connection string (wired when
+      the service is provisioned);
+    - `CORS_ALLOWED_ORIGINS` — the deployed web origin, set once the web
+      service exists (the API must read it at runtime; changing it requires
+      a redeploy).
+- Declares at least one managed database under `databases:` (provision it and
+  wire `DATABASE_URL`; name the instance `<target-slug>-<declared name>` so
+  targets never collide).
 - The service is matched back to this target by **repo + name**: keep the name
   stable across runs.
 
@@ -99,8 +99,8 @@ from `app/api/render.yaml` and `app/web/render.yaml`, validated by
 - `static_site` (Vite SPA — the default):
   - `rootDir: app/web` when set;
   - a `buildCommand` matching the app;
-  - `envVars` declaring `VITE_API_BASE_URL` with `sync: false` — wired by the
-    bootstrap to the API service URL before the first deploy (build-time env).
+  - `envVars` declaring `VITE_API_BASE_URL` with `sync: false` — the API
+    service URL (build-time env).
 - `web_service` (Next.js, container-deployed): same as the API service rules
   (`rootDir: app/web`, Dockerfile under `app/web/`), and declares
   `NEXT_PUBLIC_API_BASE_URL` with `sync: false`.
@@ -113,8 +113,8 @@ Never hard-code secrets in `render.yaml` — env references only.
 - Every operation carries an `operationId` (the web stage's typed client is
   generated from them).
 - It **matches the controllers** — verified by `api-critic` during the backend
-  stage and structurally re-validated by the web stage's gate. The web stage
-  builds its typed client from this file; it is a hard gate, not a fallback.
+  stage. The web stage treats it as a hard input and builds its typed client
+  from this file; it is a hard gate, not a fallback.
 
 ## 5. Deploy workflows (stage-owned)
 
@@ -123,7 +123,8 @@ Never hard-code secrets in `render.yaml` — env references only.
   same run; same pattern for `ci-web.yml` / `deploy-web.yml` with `app/web/**`.
 - **Graceful first run:** on the very first factory run the Render services,
   `RENDER_API_KEY` secret and `RENDER_*_SERVICE_ID` variables do not exist yet
-  when the stage pushes its workflows (the bootstrap syncs them afterwards).
+  when the stage pushes its workflows (they are provisioned outside this
+  pipeline).
   Both deploy workflows must therefore **no-op instead of failing** when the
   wiring is absent, e.g.:
 
@@ -134,17 +135,15 @@ Never hard-code secrets in `render.yaml` — env references only.
       ...
   ```
 
-- Deploys fire two ways on purpose (accepted race, idempotent on Render): the
-  pipeline's bootstrap `POST /v1/services/{id}/deploys`, and the push-triggered
-  deploy workflow. Render-side autoDeploy stays `no`.
+- Deploys are triggered by the push-triggered deploy workflow; Render-side
+  autoDeploy stays `no`.
 
-## 6. Runtime expectations the verify steps rely on
+## 6. Runtime expectations
 
 - The API answers `GET <healthCheckPath>` with 2xx when up, without auth.
 - The API honours `CORS_ALLOWED_ORIGINS` and returns
-  `Access-Control-Allow-Origin: <web origin>` (asserted live by `verify-live`).
+  `Access-Control-Allow-Origin: <web origin>`.
 - The web app reads its API base URL from `VITE_API_BASE_URL` /
   `NEXT_PUBLIC_API_BASE_URL` (never hard-coded).
 - Folder names are exactly `docs/requirements`, `docs/solution-design`,
-  `app/api`, `app/web` (the orchestrator's `REQ_FOLDER`/`DESIGN_FOLDER`
-  inputs may override the first two; agents receive them in the prompt).
+  `app/api`, `app/web` (the runner passes them in the prompt).

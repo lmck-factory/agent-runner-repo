@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one factory stage with OpenCode: timeout-guarded, session-resumable.
+# Run one factory stage with OpenCode: timeout-guarded.
 #
 # Env:
 #   STAGE            stage id (requirements|design|backend|web)
@@ -12,9 +12,7 @@
 #   MODEL_KEY        API key for the model's provider
 #   MODEL_ENVVAR     provider key env var name (default OPENROUTER_API_KEY)
 #   TIMEOUT_MIN      internal timeout in minutes (default 330; the job's own
-#                    timeout-minutes must be larger so artifacts can upload)
-#   SESSION_ID       optional: resume this session instead of starting one
-#   STATE_DIR        where logs/state land (default .factory/state)
+#                    timeout-minutes must be larger so the timeout error prints)
 set -euo pipefail
 # shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"
@@ -25,8 +23,6 @@ REQ_FOLDER="${REQ_FOLDER:-docs/requirements}"
 DESIGN_FOLDER="${DESIGN_FOLDER:-docs/solution-design}"
 MODEL_ENVVAR="${MODEL_ENVVAR:-OPENROUTER_API_KEY}"
 TIMEOUT_MIN="${TIMEOUT_MIN:-330}"
-STATE_DIR="${STATE_DIR:-.factory/state}"
-RESUME_PROMPT="${RESUME_PROMPT:-Continue the run to completion: finish the current phase, run the critic loop, deliver, commit, and push as the workspace conventions require.}"
 
 # Build the stage prompt with explicit named flags — the workspace commands
 # parse these, so folders can never land in the wrong positional slot (the
@@ -41,49 +37,23 @@ prompt_for_stage() {
   esac
 }
 
-mkdir -p "$STATE_DIR"
-LOG="$STATE_DIR/${STAGE}.log"
-STATE="$STATE_DIR/${STAGE}.state.json"
-
 # Export the provider key under the env var the selected provider expects.
 export "${MODEL_ENVVAR}=${MODEL_KEY}"
-# Keep OpenCode's data (sessions, storage) inside the workspace so it can be
-# archived for resume.
-export XDG_DATA_HOME="${XDG_DATA_HOME:-$PWD/.factory/opencode-data}"
 
 cd "$AGENT_DIR"
-log "running stage=$STAGE agent_dir=$AGENT_DIR model=$MODEL resume_session=${SESSION_ID:-<none>}"
-[ -n "${SESSION_ID:-}" ] || log "prompt=$(prompt_for_stage "$STAGE")"
+PROMPT="$(prompt_for_stage "$STAGE")"
+log "running stage=$STAGE agent_dir=$AGENT_DIR model=$MODEL"
+log "prompt=$PROMPT"
 
 set +e
-if [ -n "${SESSION_ID:-}" ]; then
-  # Resumed sessions keep their agent, but the model must stay the pipeline's
-  # — otherwise a resume silently runs on OpenCode's default model.
-  timeout --foreground "${TIMEOUT_MIN}m" \
-    opencode run --session "$SESSION_ID" -m "$MODEL" --format json "$RESUME_PROMPT" 2>&1 | tee "$LOG"
-else
-  PROMPT="$(prompt_for_stage "$STAGE")"
-  timeout --foreground "${TIMEOUT_MIN}m" \
-    opencode run --agent "$(agent_name_for_stage "$STAGE")" -m "$MODEL" --format json "$PROMPT" 2>&1 | tee "$LOG"
-fi
-rc=${PIPESTATUS[0]}
+timeout --foreground "${TIMEOUT_MIN}m" \
+  opencode run --agent "$(agent_name_for_stage "$STAGE")" -m "$MODEL" --format json "$PROMPT"
+rc=$?
 set -e
 
-# Tolerant session-id extraction: JSON("sessionID":"ses_...") or free text.
-sid="${SESSION_ID:-}"
-if [ -z "$sid" ]; then
-  sid=$(grep -o '"sessionID"[[:space:]]*:[[:space:]]*"[^"]*"' "$LOG" 2>/dev/null \
-        | tail -1 | sed 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
-fi
-if [ -z "$sid" ]; then
-  sid=$(grep -oE 'ses_[A-Za-z0-9]+' "$LOG" 2>/dev/null | tail -1 || true)
-fi
-
-printf '{"stage":"%s","session_id":"%s","exit_code":%s}\n' "$STAGE" "$sid" "$rc" > "$STATE"
-log "stage=$STAGE exit=$rc session_id=${sid:-<not found>}"
-
+log "stage=$STAGE exit=$rc"
 if [ "$rc" = "124" ]; then
-  echo "::error::stage $STAGE timed out after ${TIMEOUT_MIN}m; resumable with session ${sid:-<unknown>}" >&2
+  echo "::error::stage $STAGE timed out after ${TIMEOUT_MIN}m" >&2
   exit 124
 fi
 exit "$rc"

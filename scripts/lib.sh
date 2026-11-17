@@ -2,6 +2,11 @@
 # Shared helpers for the factory pipeline scripts.
 set -euo pipefail
 
+# Stale VS Code js-debug env: NODE_OPTIONS may point at a deleted bootloader.js,
+# which crashes any node invocation (MODULE_NOT_FOUND) before the script body
+# even runs. Harmless outside VS Code.
+unset NODE_OPTIONS VSCODE_INSPECTOR_OPTIONS
+
 log()  { echo "[factory] $*" >&2; }
 die()  { echo "[factory][error] $*" >&2; exit 1; }
 
