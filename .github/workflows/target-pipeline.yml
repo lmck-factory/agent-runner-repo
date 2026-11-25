@@ -29,7 +29,10 @@ env:
   DESIGN_FOLDER: docs/solution-design
   MODEL: ${{ vars.PIPELINE_MODEL || 'openrouter/auto' }}
   MODEL_ENVVAR: ${{ vars.PIPELINE_MODEL_ENVVAR || 'OPENROUTER_API_KEY' }}
-  OPENCODE_VERSION: ${{ vars.OPENCODE_VERSION || 'latest' }}
+  # Pinned: 1.19.6 (picked up by `latest` on 2026-11-17) coincides with every
+  # 330-minute stage timeout since — suspected subagent-hang regression.
+  # 1.19.5 is the last release with a verifiably working critic loop.
+  OPENCODE_VERSION: ${{ vars.OPENCODE_VERSION || '1.19.5' }}
   TIMEOUT_MIN: "330"
 
 jobs:
