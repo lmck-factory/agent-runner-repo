@@ -78,22 +78,13 @@ jobs:
           BEFORE_SHA: ${{ steps.before.outputs.sha }}
         run: |
           set -euo pipefail
-          source scripts/lib.sh
           br=$(gh api "repos/${TARGET}" --jq .default_branch)
           sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
           echo "requirements: ${br} ${BEFORE_SHA} -> ${sha}"
           if [ "$sha" = "$BEFORE_SHA" ]; then
-            report_no_delivery requirements "::warning::"
-            # exit 0 — the requirements stage stays advisory
+            echo "::warn::stage requirements delivered no commits — the agent possibly ended on one of its own gates (see the stage log for its stated reason)"
+            # exit 0
           fi
-      - name: Upload stage log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stage-log-requirements
-          path: ${{ runner.temp }}/factory-requirements*.log
-          if-no-files-found: ignore
-          retention-days: 7
 
   # ---------------------------------------------------------------------------
   design:
@@ -138,22 +129,13 @@ jobs:
           BEFORE_SHA: ${{ steps.before.outputs.sha }}
         run: |
           set -euo pipefail
-          source scripts/lib.sh
           br=$(gh api "repos/${TARGET}" --jq .default_branch)
           sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
           echo "design: ${br} ${BEFORE_SHA} -> ${sha}"
           if [ "$sha" = "$BEFORE_SHA" ]; then
-            report_no_delivery design "::error::"
+            echo "::error::stage design delivered no commits — the agent most likely ended on one of its own gates (see the stage log for its stated reason)"
             exit 1
           fi
-      - name: Upload stage log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stage-log-design
-          path: ${{ runner.temp }}/factory-design*.log
-          if-no-files-found: ignore
-          retention-days: 7
 
   # ---------------------------------------------------------------------------
   backend:
@@ -198,22 +180,13 @@ jobs:
           BEFORE_SHA: ${{ steps.before.outputs.sha }}
         run: |
           set -euo pipefail
-          source scripts/lib.sh
           br=$(gh api "repos/${TARGET}" --jq .default_branch)
           sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
           echo "backend: ${br} ${BEFORE_SHA} -> ${sha}"
           if [ "$sha" = "$BEFORE_SHA" ]; then
-            report_no_delivery backend "::error::"
+            echo "::error::stage backend delivered no commits — the agent most likely ended on one of its own gates (see the stage log for its stated reason)"
             exit 1
           fi
-      - name: Upload stage log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stage-log-backend
-          path: ${{ runner.temp }}/factory-backend*.log
-          if-no-files-found: ignore
-          retention-days: 7
 
   # ---------------------------------------------------------------------------
   web:
@@ -258,19 +231,10 @@ jobs:
           BEFORE_SHA: ${{ steps.before.outputs.sha }}
         run: |
           set -euo pipefail
-          source scripts/lib.sh
           br=$(gh api "repos/${TARGET}" --jq .default_branch)
           sha=$(gh api "repos/${TARGET}/commits/${br}" --jq .sha)
           echo "web: ${br} ${BEFORE_SHA} -> ${sha}"
           if [ "$sha" = "$BEFORE_SHA" ]; then
-            report_no_delivery web "::error::"
+            echo "::error::stage web delivered no commits — the agent most likely ended on one of its own gates (see the stage log for its stated reason)"
             exit 1
           fi
-      - name: Upload stage log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stage-log-web
-          path: ${{ runner.temp }}/factory-web*.log
-          if-no-files-found: ignore
-          retention-days: 7
